@@ -1,7 +1,4 @@
-// ========= Pump.fun Strategy Bot (ESM) =========
-// Signals: early unique buyers, buy velocity, buy/sell ratio, liquidity window, whale dominance
-// Entry: after ~2.5s micro-window scoring (not instant market buy)
-// Exit: +TAKE_PROFIT_PCT take-profit (existing), you can add SL later
+// ========= Pump.fun Strategy Bot (ESM, with per-mint trade subscription) =========
 
 import 'dotenv/config';
 import WebSocket from 'ws';
@@ -11,44 +8,50 @@ import {
   Connection, Keypair, VersionedTransaction, LAMPORTS_PER_SOL
 } from '@solana/web3.js';
 
-// ====== CORE ENV ======
+/* ---------- CORE ENV ---------- */
 const RPC_URL       = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-const PUBKEY        = process.env.PUBLIC_KEY;               // Local: your wallet | Lightning: lightning wallet pubkey
-const SECRET        = process.env.WALLET_PRIVATE_KEY;       // Local only (bs58)
+const PUBKEY        = process.env.PUBLIC_KEY;                // Local: your wallet | Lightning: lightning wallet pubkey
+const SECRET        = process.env.WALLET_PRIVATE_KEY;        // Local only (bs58)
 const BUY_SOL       = parseFloat(process.env.BUY_SOL || '0.005');
 const SLIPPAGE      = parseInt(process.env.SLIPPAGE || '15', 10);
 const PRIORITY_FEE  = parseFloat(process.env.PRIORITY_FEE || '0.0000');
 const TAKE_PROFIT   = parseFloat(process.env.TAKE_PROFIT_PCT || '50') / 100;
+const STOP_LOSS     = parseFloat(process.env.STOP_LOSS_PCT || '25') / 100;
 
-// ====== STRATEGY ENV (tune as needed) ======
-const BUY_WINDOW_MS        = parseInt(process.env.BUY_WINDOW_MS || '2500', 10);  // observation window
-const MIN_BUYS             = parseInt(process.env.MIN_BUYS || '12', 10);
-const MIN_UNIQUE           = parseInt(process.env.MIN_UNIQUE || '10', 10);
-const MIN_BUY_SELL_RATIO   = parseFloat(process.env.MIN_BUY_SELL_RATIO || '4.0');
-const MAX_WHALE_SHARE      = parseFloat(process.env.MAX_WHALE_SHARE || '0.35');  // <=35%
-const MIN_LIQ_SOL          = parseFloat(process.env.MIN_LIQ_SOL || '0.30');      // vSolInBondingCurve
+/* ---------- STRATEGY ENV (defaults = recommended) ---------- */
+const BUY_WINDOW_MS        = parseInt(process.env.BUY_WINDOW_MS || '2500', 10);
+const MIN_BUYS             = parseInt(process.env.MIN_BUYS || '10', 10);
+const MIN_UNIQUE           = parseInt(process.env.MIN_UNIQUE || '8', 10);
+const MIN_BUY_SELL_RATIO   = parseFloat(process.env.MIN_BUY_SELL_RATIO || '3.0');
+const MIN_LIQ_SOL          = parseFloat(process.env.MIN_LIQ_SOL || '0.30');
 const MAX_LIQ_SOL          = parseFloat(process.env.MAX_LIQ_SOL || '5.0');
-const MIN_SCORE            = parseFloat(process.env.MIN_SCORE || '0.75');        // 0..1 composite
-const COOLDOWN_MS          = parseInt(process.env.BUY_COOLDOWN_MS || '60000', 10);
 
-// Optional Lightning mode
-const USE_LIGHTNING = (process.env.USE_LIGHTNING || 'false').toLowerCase() === 'true';
-const PP_API_KEY    = process.env.PP_API_KEY || '';
+// whales: presence but not dominance
+const REQUIRE_WHALE        = (process.env.REQUIRE_WHALE || 'true').toLowerCase() === 'true';
+const MIN_WHALE_SHARE      = parseFloat(process.env.MIN_WHALE_SHARE || '0.15'); // 15%
+const MAX_WHALE_SHARE      = parseFloat(process.env.MAX_WHALE_SHARE || '0.40'); // 40%
+const WHALE_SOL_ALERT      = parseFloat(process.env.WHALE_SOL_ALERT || '0.5');  // ~0.5 SOL in window
+const BUY_COOLDOWN_MS      = parseInt(process.env.BUY_COOLDOWN_MS || '30000', 10);
 
-console.log('[ENV] RPC_URL =', RPC_URL);
-console.log('[ENV] PUBLIC_KEY set =', !!PUBKEY);
-console.log('[ENV] WALLET_PRIVATE_KEY set =', !!SECRET, '(ignored in Lightning mode)');
-console.log('[ENV] USE_LIGHTNING =', USE_LIGHTNING);
+// logging
+const SHOW_BUYERS          = (process.env.SHOW_BUYERS || 'true').toLowerCase() === 'true';
+const TOP_BUYERS           = parseInt(process.env.TOP_BUYERS || '3', 10);
 
-// ====== CONNECTIONS ======
+/* ---------- Lightning (optional) ---------- */
+const USE_LIGHTNING        = (process.env.USE_LIGHTNING || 'false').toLowerCase() === 'true';
+const PP_API_KEY           = process.env.PP_API_KEY || '';
+
+console.log('[ENV] RPC_URL=', RPC_URL);
+console.log('[ENV] PUBLIC_KEY set=', !!PUBKEY, 'USE_LIGHTNING=', USE_LIGHTNING);
+
+/* ---------- Connections / signer ---------- */
 const conn = new Connection(RPC_URL, { commitment: 'confirmed' });
 const httpAgent = new Agent({ keepAlive: true, keepAliveTimeout: 60e3, keepAliveMaxTimeout: 60e3 });
 
-// signer (local only)
 let signer = null;
 if (!USE_LIGHTNING) {
   if (!PUBKEY || !SECRET) {
-    console.error('Secrets not set! Need PUBLIC_KEY & WALLET_PRIVATE_KEY for local mode.');
+    console.error('Secrets not set! Need PUBLIC_KEY & WALLET_PRIVATE_KEY (local mode).');
     setInterval(() => {}, 1e9);
   } else {
     signer = Keypair.fromSecretKey(bs58.decode(SECRET));
@@ -60,13 +63,13 @@ if (!USE_LIGHTNING) {
   }
 }
 
-// ====== STATE ======
+/* ---------- State ---------- */
 const WS_URL = 'wss://pumpportal.fun/api/data';
-const pos = new Map();      // mint -> { entryCostSol, tokenQty }
-const watch = new Map();    // mint -> { start, timer, buys, sells, buyers Map(addr->tokens), lastVSol }
+const pos = new Map();      // mint -> { entryCostSol, tokenQty, peakExitVal? }
+const watch = new Map();    // mint -> { start, timer, buys, sells, buyers Map(addr->{tok,sol}), lastVSol }
 let lastBuyAt = 0;
 
-// ====== HELPERS ======
+/* ---------- Helpers ---------- */
 function estSolPerToken(m) {
   const vs = +m?.vSolInBondingCurve, vt = +m?.vTokensInBondingCurve;
   return (vs > 0 && vt > 0) ? (vs / vt) : null;
@@ -83,6 +86,7 @@ async function logAndGetBalance() {
     return 0;
   }
 }
+
 const COMMON_HEADERS = {
   accept: '*/*', 'user-agent': 'pump-bot/1.0',
   origin: 'https://pump.fun', referer: 'https://pump.fun/'
@@ -104,7 +108,7 @@ async function postForm(url, body) {
   });
 }
 
-// ====== TRADE (LOCAL / LIGHTNING) ======
+/* ---------- Trade (local / lightning) ---------- */
 const TRADE_ENDPOINTS = [
   process.env.TRADE_URL || 'https://pumpportal.fun/api/trade-local',
   'https://www.pumpportal.fun/api/trade-local',
@@ -122,12 +126,12 @@ async function tradeLocal(body) {
           if (u8.length > 0) bytes = u8;
         } catch {}
         if (!bytes) {
+          // parse JSON b64 or retry as FORM
           try {
             const j = await r.json();
             const b64 = j?.transaction || j?.tx || j?.data;
             if (b64) bytes = Buffer.from(b64, 'base64');
           } catch {
-            // FORM fallback
             r = await postForm(url, body);
             try {
               const ab2 = await r.arrayBuffer();
@@ -179,13 +183,16 @@ async function tradeLightning(body) {
 }
 async function trade(body) { return USE_LIGHTNING ? await tradeLightning(body) : await tradeLocal(body); }
 
-// ====== STRATEGY SCORER ======
+/* ---------- Watch window (orderflow scoring) ---------- */
 function startWatch(m) {
   const mint = m.mint;
   if (watch.has(mint)) return;
   const rec = {
-    start: Date.now(), buys: 0, sells: 0, buyers: new Map(), lastVSol: +m?.vSolInBondingCurve || 0,
-    timer: setTimeout(()=>evaluateMint(mint), BUY_WINDOW_MS)
+    start: Date.now(),
+    buys: 0, sells: 0,
+    buyers: new Map(),                 // addr -> { tok, sol }
+    lastVSol: +m?.vSolInBondingCurve || 0,
+    timer: setTimeout(() => evaluateMint(mint), BUY_WINDOW_MS)
   };
   watch.set(mint, rec);
 }
@@ -193,11 +200,18 @@ function updateWatch(m) {
   const rec = watch.get(m.mint);
   if (!rec) return;
   if (Date.now() - rec.start > BUY_WINDOW_MS) return;
+
   if (m.txType === 'buy') {
     rec.buys++;
     const addr = m.traderPublicKey || 'unknown';
-    const got  = Number(m.tokenAmount || 0);
-    rec.buyers.set(addr, (rec.buyers.get(addr) || 0) + got);
+    const gotTok = Number(m.tokenAmount || 0);
+    if (gotTok > 0) {
+      const spt = estSolPerToken(m);
+      const prev = rec.buyers.get(addr) || { tok: 0, sol: 0 };
+      prev.tok += gotTok;
+      if (spt) prev.sol += gotTok * spt;
+      rec.buyers.set(addr, prev);
+    }
   }
   if (m.txType === 'sell') rec.sells++;
   if (+m?.vSolInBondingCurve > 0) rec.lastVSol = +m.vSolInBondingCurve;
@@ -207,51 +221,70 @@ function evaluateMint(mint) {
   if (!rec) return;
   watch.delete(mint);
 
-  // compute metrics
-  const buys = rec.buys, sells = rec.sells;
+  const buys   = rec.buys;
+  const sells  = rec.sells;
   const unique = rec.buyers.size;
-  const ratio = buys / Math.max(1, sells);
-  const vsol = rec.lastVSol;
+  const ratio  = buys / Math.max(1, sells);
+  const vsol   = rec.lastVSol;
 
-  // whale share
-  let totalTok = 0, maxTok = 0;
-  for (const v of rec.buyers.values()) { totalTok += v; if (v > maxTok) maxTok = v; }
+  // whale share (by tokens)
+  let totalTok = 0, maxTok = 0, whaleAddr = null;
+  for (const [addr, v] of rec.buyers.entries()) {
+    totalTok += v.tok;
+    if (v.tok > maxTok) { maxTok = v.tok; whaleAddr = addr; }
+  }
   const whaleShare = totalTok > 0 ? (maxTok / totalTok) : 0;
 
-  // raw gates
-  const gates =
-    buys >= MIN_BUYS &&
-    unique >= MIN_UNIQUE &&
-    ratio >= MIN_BUY_SELL_RATIO &&
-    vsol >= MIN_LIQ_SOL && vsol <= MAX_LIQ_SOL &&
-    whaleShare <= MAX_WHALE_SHARE;
+  // top buyers by est SOL
+  const arr = [...rec.buyers.entries()].map(([addr, v]) => ({
+    addr, tok: v.tok, sol: v.sol || 0
+  })).sort((a,b)=> (b.sol - a.sol) || (b.tok - a.tok));
 
-  // score (0..1)
+  if (SHOW_BUYERS) {
+    const top = arr.slice(0, Math.max(1, TOP_BUYERS))
+      .map(x => `${x.addr.slice(0,6)}…${x.addr.slice(-4)} ~${x.sol.toFixed(3)} SOL`)
+      .join(', ');
+    console.log('[BUYERS]', mint, 'top:', top || '—');
+  }
+  const topBySol = arr[0]?.sol || 0;
+  if ((whaleShare >= MIN_WHALE_SHARE && topBySol >= WHALE_SOL_ALERT) || whaleShare >= MAX_WHALE_SHARE) {
+    console.log('[WHALE]', mint, 'share=', (whaleShare*100).toFixed(1)+'%', 'top≈', topBySol.toFixed(3), 'SOL');
+  }
+
+  // gates + score
+  const whaleGate = REQUIRE_WHALE
+    ? (whaleShare >= MIN_WHALE_SHARE && whaleShare <= MAX_WHALE_SHARE)
+    : (whaleShare <= MAX_WHALE_SHARE);
+
+  const gates =
+    buys   >= MIN_BUYS &&
+    unique >= MIN_UNIQUE &&
+    ratio  >= MIN_BUY_SELL_RATIO &&
+    vsol   >= MIN_LIQ_SOL && vsol <= MAX_LIQ_SOL &&
+    whaleGate;
+
+  // simple composite score (0..1)
   const f = (x, t) => Math.min(1, x / t);
   const vsolOK = (vsol >= MIN_LIQ_SOL && vsol <= MAX_LIQ_SOL) ? 1 : 0;
+  const whalePenalty = 1 - Math.min(1, whaleShare / Math.max(1e-9, MAX_WHALE_SHARE)); // bigger share => lower score
   const score =
     0.25 * f(buys,   MIN_BUYS) +
     0.25 * f(unique, MIN_UNIQUE) +
     0.20 * f(ratio,  MIN_BUY_SELL_RATIO) +
-    0.20 * (1 - Math.min(1, whaleShare / MAX_WHALE_SHARE)) +
+    0.20 * whalePenalty +
     0.10 * vsolOK;
 
-  console.log('[SCORE]', mint, 'buys=', buys, 'unique=', unique, 'ratio=', ratio.toFixed(2),
-              'vsol=', vsol.toFixed(2), 'whale=', (whaleShare*100).toFixed(1)+'%', '→ score=', score.toFixed(2));
+  console.log('[SCORE]', mint, 'buys=', buys, 'unique=', unique,
+              'ratio=', ratio.toFixed(2), 'vsol=', vsol.toFixed(2),
+              'whale=', (whaleShare*100).toFixed(1)+'%', '→', score.toFixed(2));
 
-  if (!gates || score < MIN_SCORE) return; // skip weak ones
-  // cooldown
-  if (Date.now() - lastBuyAt < COOLDOWN_MS) { console.log('[SKIP] cooldown'); return; }
-  // balance guard (local only)
-  if (!USE_LIGHTNING && signer) {
-    const need = BUY_SOL + PRIORITY_FEE + 0.002;
-    // we won't await balance here to avoid delay; last fetched balance is enough
-  }
+  if (!gates) { console.log('[SKIP]', mint, 'gates fail'); return; }
+  if (Date.now() - lastBuyAt < BUY_COOLDOWN_MS) { console.log('[SKIP] cooldown'); return; }
   instantBuy(mint);
 }
 
+/* ---------- Buy/Sell ---------- */
 async function instantBuy(mint) {
-  // local balance check
   if (!USE_LIGHTNING) {
     const bal = await logAndGetBalance();
     const need = (BUY_SOL || 0) + (PRIORITY_FEE || 0) + 0.002;
@@ -267,7 +300,7 @@ async function instantBuy(mint) {
   };
   const sig = await trade(body);
   if (sig) {
-    pos.set(mint, { entryCostSol: BUY_SOL + PRIORITY_FEE, tokenQty: 0 });
+    pos.set(mint, { entryCostSol: BUY_SOL + PRIORITY_FEE, tokenQty: 0, peakExitVal: 0 });
     lastBuyAt = Date.now();
   }
 }
@@ -282,7 +315,16 @@ async function sellAll(mint) {
   pos.delete(mint);
 }
 
-// ====== WS LOOP ======
+/* ---------- WebSocket loop + per-mint subscribe/unsubscribe ---------- */
+function subscribeMintForWindow(ws, mint) {
+  // subscribe to trades for this mint
+  ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+  // auto-unsubscribe after observation window
+  setTimeout(() => {
+    ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }));
+  }, BUY_WINDOW_MS + 500);
+}
+
 function openWS() {
   const ws = new WebSocket(WS_URL, { perMessageDeflate: false });
 
@@ -295,17 +337,18 @@ function openWS() {
   ws.on('message', (buf) => {
     let m; try { m = JSON.parse(buf); } catch { return; }
 
-    // 1) New token → start observation window (no instant buy)
+    // New token → start observation + subscribe that mint's trades
     if (m?.txType === 'create' && m?.mint) {
       console.log('[NEW TOKEN]', m.mint);
       startWatch(m);
+      subscribeMintForWindow(ws, m.mint);
       return;
     }
 
-    // 2) Update watch with orderflow
+    // Update watch with incoming trades for that mint
     if (m?.mint && watch.has(m.mint)) updateWatch(m);
 
-    // 3) Our account trades (fills)
+    // Our account fills
     if (m?.traderPublicKey === PUBKEY && m?.mint) {
       const p = pos.get(m.mint);
       if (p) {
@@ -324,16 +367,22 @@ function openWS() {
       return;
     }
 
-    // 4) Price ticks → take-profit
+    // Price ticks → TP/SL
     if (m?.mint && pos.has(m.mint)) {
       const p = pos.get(m.mint);
       if (!p?.tokenQty) return;
-      const spt = estSolPerToken(m);
-      if (!spt) return;
+      const spt = estSolPerToken(m); if (!spt) return;
       const estExit = spt * p.tokenQty;
-      const target = p.entryCostSol * (1 + TAKE_PROFIT);
-      if (estExit >= target) {
-        console.log('[TP HIT]', m.mint, 'exit≈', estExit.toFixed(4), 'target≈', target.toFixed(4));
+      p.peakExitVal = Math.max(p.peakExitVal || 0, estExit);
+
+      const tp = p.entryCostSol * (1 + TAKE_PROFIT);
+      const sl = p.entryCostSol * (1 - STOP_LOSS);
+
+      if (estExit >= tp) {
+        console.log('[TP HIT]', m.mint, 'exit≈', estExit.toFixed(4), 'target≈', tp.toFixed(4));
+        sellAll(m.mint);
+      } else if (estExit <= sl) {
+        console.log('[SL HIT]', m.mint, 'exit≈', estExit.toFixed(4), 'stop≈', sl.toFixed(4));
         sellAll(m.mint);
       }
     }
