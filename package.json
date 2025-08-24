@@ -1,9 +1,9 @@
 {
   "name": "pumpfun-bot",
   "version": "1.0.0",
-  "description": "Pump.fun sniper bot for instant buy and auto sell",
+  "description": "Pump.fun sniper bot (instant buy + 50% TP)",
   "main": "bot.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "node bot.js"
   },
