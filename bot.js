@@ -1,8 +1,8 @@
 // ============= OLD-TOKEN MOMENTUM BOT (Lightning mode) =============
-// DexScreener boosted Solana tokens -> SOL-quoted pairs (supported DEX only)
-// Buy via PumpPortal Lightning with correct `pool` (raydium/pump/bonk)
+// DexScreener boosted Solana tokens -> supported DEX pairs (SOL/USDC quotes ok)
+// Buy via PumpPortal Lightning with correct `pool`
 // Exit: +20% TP, trailing after TP, TTL exit if no min profit (no hard SL)
-// Robust: 404-safe + multi-endpoint fallback for pairs.
+// Robust: 404-safe + multi-endpoint fallback for pairs + smart skipping
 // -------------------------------------------------------------------
 
 import 'dotenv/config';
@@ -50,7 +50,6 @@ const DAILY_MAX_BUYS = parseInt(process.env.DAILY_MAX_BUYS || '6', 10);
 const BUY_COOLDOWN_MS= parseInt(process.env.BUY_COOLDOWN_MS || '60000', 10);  // 1 min
 
 /* constants */
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DS_BASE  = 'https://api.dexscreener.com';
 const PUMP_LGT = 'https://pumpportal.fun/api/trade';
 const SUPPORTED_DEX = ['raydium', 'raydium-cpmm', 'pump', 'pumpfun', 'pumpswap', 'bonk', 'launchlab'];
@@ -68,7 +67,7 @@ let lastBuyAt = 0;
 // mint -> pos
 // pos: { pairAddress, entryCostSol, tokenQty, peakExitVal, tpSeen, openedAt, pool }
 const positions = new Map();
-// avoid re-buy spam per token id
+// avoid re-buy spam per token id when appropriate
 const attempted = new Set();
 
 /* ---------- utils ---------- */
@@ -108,6 +107,11 @@ async function ensureQtyFromChain(mint) {
   }
 }
 
+function isSupportedDex(pair){
+  const dex = (pair?.dexId || '').toLowerCase();
+  return SUPPORTED_DEX.some(s => dex.includes(s));
+}
+
 /* ---------- choose Lightning pool from pair.dexId ---------- */
 function choosePoolForPair(pair){
   const dex = (pair?.dexId || '').toLowerCase();
@@ -135,7 +139,7 @@ async function tradeLightning({ action, mint, amount, denomSol=true, slippage=SL
   return sig;
 }
 
-/* ---------- boosted IDs (skip pump.fun mint IDs) ---------- */
+/* ---------- boosted IDs (skip new-mint style ids ending with ...pump) ---------- */
 async function fetchBoostedSolanaMints(){
   const boosts = await getJson(`${DS_BASE}/token-boosts/latest/v1`);
   const rows = Array.isArray(boosts) ? boosts : (boosts?.tokens || boosts?.data || []);
@@ -145,8 +149,7 @@ async function fetchBoostedSolanaMints(){
   for (const r of sols) {
     const t = r.tokenAddress || r.address || r.token;
     if (!t) continue;
-    // old-token mode: skip new-mint style ids (…pump)
-    if (String(t).toLowerCase().endsWith('pump')) continue;
+    if (String(t).toLowerCase().endsWith('pump')) continue; // old-token mode only
     set.add(t);
   }
   return [...set];
@@ -179,35 +182,33 @@ async function fetchPairsForId(id){
   return [];
 }
 
-/* ---------- choose best SOL-quoted pair (supported DEX only) ---------- */
-function pickBestSolPair(pairs){
-  const sols = pairs
-    .filter(p => p?.quoteToken?.address === SOL_MINT)
-    .filter(p => SUPPORTED_DEX.some(s => (p?.dexId || '').toLowerCase().includes(s)));
-  if (sols.length === 0) return null;
+/* ---------- choose best pair (supported DEX only; SOL/USDC both ok) ---------- */
+function pickBestPair(pairs){
+  const supported = pairs.filter(p => isSupportedDex(p));
+  if (supported.length === 0) return { best: null, reason: 'unsupported-dex' };
 
-  const scored = sols.map(p => {
-    const ch5  = +p?.priceChange?.m5 || 0;
-    const vol5 = +p?.volume?.m5 || 0;
-    const buys = +p?.txns?.m5?.buys || 0;
-    const sells= +p?.txns?.m5?.sells || 0;
-    const liq  = +p?.liquidity?.usd || 0;
-    const ratio= buys / Math.max(1, sells);
-    let score  = 0;
-    if (ch5 >= MIN_5M_CHANGE) score += 1;
-    if (vol5 >= MIN_VOL_5M_USD) score += 1;
-    if (buys >= MIN_5M_BUYS) score += 1;
-    if (ratio >= MIN_BUY_SELL_R) score += 1;
-    if (liq >= MIN_LIQ_USD && liq <= MAX_LIQ_USD) score += 1;
-    return { p, score, ch5, vol5, buys, ratio, liq };
+  const scored = supported.map(p => {
+    const ch5   = +p?.priceChange?.m5 || 0;
+    const vol5  = +p?.volume?.m5 || 0;
+    const buys  = +p?.txns?.m5?.buys || 0;
+    const sells = +p?.txns?.m5?.sells || 0;
+    const liq   = +p?.liquidity?.usd || 0;
+    const ratio = buys / Math.max(1, sells);
+    let score   = 0;
+    if (ch5  >= MIN_5M_CHANGE)     score += 1;
+    if (vol5 >= MIN_VOL_5M_USD)    score += 1;
+    if (buys >= MIN_5M_BUYS)       score += 1;
+    if (ratio>= MIN_BUY_SELL_R)    score += 1;
+    if (liq  >= MIN_LIQ_USD && liq <= MAX_LIQ_USD) score += 1;
+    return { p: p, score, ch5, vol5, buys, sells, ratio, liq };
   }).sort((a,b)=> b.score - a.score || b.ch5 - a.ch5);
 
-  const best = scored[0];
-  if (!best || best.score < 4) return null; // need at least 4/5 signals
-  return best.p;
+  const top = scored[0];
+  if (!top || top.score < 4) return { best: null, reason: 'filters-failed' }; // need ≥4/5 signals
+  return { best: top.p, reason: 'ok' };
 }
 
-/* ---------- scanner (404-safe, pool-aware) ---------- */
+/* ---------- scanner (404-safe, pool-aware, smart attempted) ---------- */
 async function scanAndMaybeBuy(){
   rotateDayIfNeeded();
   try {
@@ -224,19 +225,33 @@ async function scanAndMaybeBuy(){
 
       try {
         const pairs = await fetchPairsForId(mint);
-        if (!pairs.length) { console.log('[SKIP]', mint, 'no pairs'); attempted.add(mint); continue; }
+        if (!pairs.length) {
+          console.log('[SKIP]', mint, 'no pairs found');
+          attempted.add(mint);                 // no pair: avoid spam
+          continue;
+        }
 
-        const best = pickBestSolPair(pairs);
-        if (!best) { console.log('[SKIP]', mint, 'no SOL-quoted pair hitting filters / unsupported DEX'); attempted.add(mint); continue; }
+        const pick = pickBestPair(pairs);
+        if (!pick.best) {
+          if (pick.reason === 'unsupported-dex') {
+            console.log('[SKIP]', mint, 'unsupported DEX');
+            attempted.add(mint);               // unsupported: avoid spam
+          } else {
+            console.log('[SKIP]', mint, 'filters not met (will recheck later)');
+            // filters-failed: DO NOT add to attempted => we can re-evaluate next cycles
+          }
+          continue;
+        }
 
+        const best     = pick.best;
         const baseMint = best?.baseToken?.address;
         const pairAddr = best?.pairAddress;
-        const ch5  = +best?.priceChange?.m5 || 0;
-        const vol5 = +best?.volume?.m5 || 0;
-        const buys = +best?.txns?.m5?.buys || 0;
-        const sells= +best?.txns?.m5?.sells || 0;
-        const liq  = +best?.liquidity?.usd || 0;
-        const pool = choosePoolForPair(best);
+        const ch5      = +best?.priceChange?.m5 || 0;
+        const vol5     = +best?.volume?.m5 || 0;
+        const buys     = +best?.txns?.m5?.buys || 0;
+        const sells    = +best?.txns?.m5?.sells || 0;
+        const liq      = +best?.liquidity?.usd || 0;
+        const pool     = choosePoolForPair(best);
 
         console.log('[CANDIDATE]', baseMint, 'pair=', pairAddr, 'dexId=', best?.dexId,
           `5m%=${ch5} vol5=$${vol5} buys=${buys}/${sells} liq=$${liq} pool=${pool}`);
@@ -244,7 +259,7 @@ async function scanAndMaybeBuy(){
         await tradeLightning({ action: 'buy', mint: baseMint, amount: BUY_SOL, pool });
         lastBuyAt = Date.now();
         buysToday += 1;
-        attempted.add(mint);
+        attempted.add(mint);                   // buy attempted: mark once
 
         positions.set(baseMint, {
           pairAddress: pairAddr,
@@ -262,7 +277,7 @@ async function scanAndMaybeBuy(){
 
       } catch (e) {
         console.error('[CANDIDATE ERR]', mint, e?.message || e);
-        attempted.add(mint);
+        attempted.add(mint); // mark to avoid spamming a bad id this session
         continue;
       }
     }
@@ -294,7 +309,7 @@ async function monitorPosition(mint){
       }
 
       const pair = await fetchPair(pairAddress);
-      const priceNative = +pair?.priceNative || 0; // in SOL (quote=SOL)
+      const priceNative = +pair?.priceNative || 0; // in SOL (DexScreener native)
       if (priceNative <= 0 || !pos.tokenQty) { await sleep(2500); continue; }
 
       const estExit = priceNative * pos.tokenQty; // SOL value
