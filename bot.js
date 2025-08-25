@@ -1,4 +1,4 @@
-// ========= Pump.fun Strategy Bot (ESM, with per-mint trade subscription) =========
+// ========= Pump.fun Strategy Bot (ESM, Lightning-ready) =========
 
 import 'dotenv/config';
 import WebSocket from 'ws';
@@ -18,7 +18,7 @@ const PRIORITY_FEE  = parseFloat(process.env.PRIORITY_FEE || '0.0000');
 const TAKE_PROFIT   = parseFloat(process.env.TAKE_PROFIT_PCT || '50') / 100;
 const STOP_LOSS     = parseFloat(process.env.STOP_LOSS_PCT || '25') / 100;
 
-/* ---------- STRATEGY ENV (defaults = recommended) ---------- */
+/* ---------- STRATEGY ENV ---------- */
 const BUY_WINDOW_MS        = parseInt(process.env.BUY_WINDOW_MS || '2500', 10);
 const MIN_BUYS             = parseInt(process.env.MIN_BUYS || '10', 10);
 const MIN_UNIQUE           = parseInt(process.env.MIN_UNIQUE || '8', 10);
@@ -26,16 +26,23 @@ const MIN_BUY_SELL_RATIO   = parseFloat(process.env.MIN_BUY_SELL_RATIO || '3.0')
 const MIN_LIQ_SOL          = parseFloat(process.env.MIN_LIQ_SOL || '0.30');
 const MAX_LIQ_SOL          = parseFloat(process.env.MAX_LIQ_SOL || '5.0');
 
-// whales: presence but not dominance
 const REQUIRE_WHALE        = (process.env.REQUIRE_WHALE || 'true').toLowerCase() === 'true';
 const MIN_WHALE_SHARE      = parseFloat(process.env.MIN_WHALE_SHARE || '0.15'); // 15%
 const MAX_WHALE_SHARE      = parseFloat(process.env.MAX_WHALE_SHARE || '0.40'); // 40%
 const WHALE_SOL_ALERT      = parseFloat(process.env.WHALE_SOL_ALERT || '0.5');  // ~0.5 SOL in window
 const BUY_COOLDOWN_MS      = parseInt(process.env.BUY_COOLDOWN_MS || '30000', 10);
 
-// logging
 const SHOW_BUYERS          = (process.env.SHOW_BUYERS || 'true').toLowerCase() === 'true';
 const TOP_BUYERS           = parseInt(process.env.TOP_BUYERS || '3', 10);
+
+/* ---------- (Optional) Daily cap ---------- */
+const DAILY_MAX_BUYS       = parseInt(process.env.DAILY_MAX_BUYS || '0', 10);   // 0 = ignore
+let buysToday = 0;
+let dayStamp  = new Date().toISOString().slice(0,10);
+function rotateDayIfNeeded(){
+  const d = new Date().toISOString().slice(0,10);
+  if (d !== dayStamp) { dayStamp = d; buysToday = 0; console.log('[DAY RESET]', d); }
+}
 
 /* ---------- Lightning (optional) ---------- */
 const USE_LIGHTNING        = (process.env.USE_LIGHTNING || 'false').toLowerCase() === 'true';
@@ -113,6 +120,7 @@ const TRADE_ENDPOINTS = [
   process.env.TRADE_URL || 'https://pumpportal.fun/api/trade-local',
   'https://www.pumpportal.fun/api/trade-local',
 ];
+
 async function tradeLocal(body) {
   for (const url of TRADE_ENDPOINTS) {
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -152,35 +160,73 @@ async function tradeLocal(body) {
         console.log('[TRADE OK]', body.action, 'mint=', body.mint, 'sig=', sig);
         return sig;
       } catch (e) {
-        console.error('[tradeLocal]', url, 'attempt', attempt, e?.code || e?.name || '', e?.message || e);
+        console.error('[tradeLocal]', url, 'attempt', attempt, e?.message || e);
+        if (e && e.cause) console.error('[cause]', e.cause);
         await new Promise(r => setTimeout(r, 250 * attempt));
       }
     }
   }
   return null;
 }
-const TRADE_LIGHTNING = `https://pumpportal.fun/api/trade?api-key=${PP_API_KEY}`;
+
 async function tradeLightning(body) {
+  const url = `https://pumpportal.fun/api/trade?api-key=${encodeURIComponent(PP_API_KEY)}`;
   const payload = {
-    action: body.action, mint: body.mint, amount: body.amount,
-    denominatedInSol: body.denominatedInSol, slippage: body.slippage,
-    priorityFee: body.priorityFee, pool: body.pool || 'auto', skipPreflight: 'true'
+    action: body.action,
+    mint: body.mint,
+    amount: body.amount,
+    denominatedInSol: body.denominatedInSol, // "true" | "false"
+    slippage: body.slippage,
+    priorityFee: body.priorityFee,
+    pool: body.pool || 'auto',
+    skipPreflight: 'true'
   };
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const r = await postJson(TRADE_LIGHTNING, payload);
-      const j = await r.json().catch(()=>null);
-      if (!r.ok) throw new Error(JSON.stringify(j || {}));
+      // Minimal headers, no custom agent (to avoid TLS/proxy issues on hosts)
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const text = await r.text();
+      let j; try { j = JSON.parse(text); } catch {}
+
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0,200)}`);
+
       const sig = j?.signature || j?.txSig || null;
-      if (sig) console.log('[TRADE OK LGT]', body.action, 'mint=', body.mint, 'sig=', sig);
+      if (!sig) throw new Error(`No signature in response: ${text.slice(0,200)}`);
+
+      console.log('[TRADE OK LGT]', body.action, 'mint=', body.mint, 'sig=', sig);
       return sig;
     } catch (e) {
       console.error('[tradeLightning]', attempt, e?.message || e);
+      if (e && e.cause) console.error('[cause]', e.cause);
+      // Fallback: try form-encoded once after 2nd attempt
+      if (attempt === 2) {
+        try {
+          const form = new URLSearchParams(Object.entries(payload).map(([k,v]) => [k, String(v)]));
+          const r2 = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+            body: form.toString()
+          });
+          const txt2 = await r2.text();
+          let j2; try { j2 = JSON.parse(txt2); } catch {}
+          if (r2.ok && (j2?.signature || j2?.txSig)) {
+            const sig2 = j2.signature || j2.txSig;
+            console.log('[TRADE OK LGT/F]', body.action, 'mint=', body.mint, 'sig=', sig2);
+            return sig2;
+          }
+        } catch {}
+      }
       await new Promise(r => setTimeout(r, 300 * attempt));
     }
   }
   return null;
 }
+
 async function trade(body) { return USE_LIGHTNING ? await tradeLightning(body) : await tradeLocal(body); }
 
 /* ---------- Watch window (orderflow scoring) ---------- */
@@ -263,7 +309,7 @@ function evaluateMint(mint) {
     vsol   >= MIN_LIQ_SOL && vsol <= MAX_LIQ_SOL &&
     whaleGate;
 
-  // simple composite score (0..1)
+  // composite score (0..1)
   const f = (x, t) => Math.min(1, x / t);
   const vsolOK = (vsol >= MIN_LIQ_SOL && vsol <= MAX_LIQ_SOL) ? 1 : 0;
   const whalePenalty = 1 - Math.min(1, whaleShare / Math.max(1e-9, MAX_WHALE_SHARE)); // bigger share => lower score
@@ -280,6 +326,10 @@ function evaluateMint(mint) {
 
   if (!gates) { console.log('[SKIP]', mint, 'gates fail'); return; }
   if (Date.now() - lastBuyAt < BUY_COOLDOWN_MS) { console.log('[SKIP] cooldown'); return; }
+
+  rotateDayIfNeeded();
+  if (DAILY_MAX_BUYS > 0 && buysToday >= DAILY_MAX_BUYS) { console.log('[SKIP] daily max buys reached'); return; }
+
   instantBuy(mint);
 }
 
@@ -302,6 +352,8 @@ async function instantBuy(mint) {
   if (sig) {
     pos.set(mint, { entryCostSol: BUY_SOL + PRIORITY_FEE, tokenQty: 0, peakExitVal: 0 });
     lastBuyAt = Date.now();
+    rotateDayIfNeeded();
+    buysToday += 1;
   }
 }
 
@@ -315,16 +367,15 @@ async function sellAll(mint) {
   pos.delete(mint);
 }
 
-/* ---------- WebSocket loop + per-mint subscribe/unsubscribe ---------- */
+/* ---------- WS subscribe/unsubscribe per mint ---------- */
 function subscribeMintForWindow(ws, mint) {
-  // subscribe to trades for this mint
   ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
-  // auto-unsubscribe after observation window
   setTimeout(() => {
     ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }));
   }, BUY_WINDOW_MS + 500);
 }
 
+/* ---------- WebSocket loop ---------- */
 function openWS() {
   const ws = new WebSocket(WS_URL, { perMessageDeflate: false });
 
@@ -337,7 +388,7 @@ function openWS() {
   ws.on('message', (buf) => {
     let m; try { m = JSON.parse(buf); } catch { return; }
 
-    // New token → start observation + subscribe that mint's trades
+    // New token → start observation + subscribe its trades
     if (m?.txType === 'create' && m?.mint) {
       console.log('[NEW TOKEN]', m.mint);
       startWatch(m);
@@ -345,7 +396,7 @@ function openWS() {
       return;
     }
 
-    // Update watch with incoming trades for that mint
+    // Update watch with incoming trades
     if (m?.mint && watch.has(m.mint)) updateWatch(m);
 
     // Our account fills
