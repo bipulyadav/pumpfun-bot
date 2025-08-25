@@ -1,7 +1,8 @@
 // ============= OLD-TOKEN MOMENTUM BOT (Lightning mode) =============
-// DexScreener boosted Solana tokens -> SOL-quoted pairs -> buy via Lightning
-// Exit: +20% TP, then trailing; TTL exit if no min profit (no hard SL).
-// 404-safe + multi-endpoint fallback for pairs.
+// DexScreener boosted Solana tokens -> SOL-quoted pairs (supported DEX only)
+// Buy via PumpPortal Lightning with correct `pool` (raydium/pump/bonk)
+// Exit: +20% TP, trailing after TP, TTL exit if no min profit (no hard SL)
+// Robust: 404-safe + multi-endpoint fallback for pairs.
 // -------------------------------------------------------------------
 
 import 'dotenv/config';
@@ -52,6 +53,7 @@ const BUY_COOLDOWN_MS= parseInt(process.env.BUY_COOLDOWN_MS || '60000', 10);  //
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DS_BASE  = 'https://api.dexscreener.com';
 const PUMP_LGT = 'https://pumpportal.fun/api/trade';
+const SUPPORTED_DEX = ['raydium', 'raydium-cpmm', 'pump', 'pumpfun', 'pumpswap', 'bonk', 'launchlab'];
 
 console.log('[ENV] Lightning=true, BUY_SOL=', BUY_SOL, 'TP=', TAKE_PROFIT, 'TRAIL=', TRAIL_PCT);
 
@@ -64,7 +66,7 @@ let dayStamp  = new Date().toISOString().slice(0,10);
 let lastBuyAt = 0;
 
 // mint -> pos
-// pos: { pairAddress, entryCostSol, tokenQty, peakExitVal, tpSeen, openedAt }
+// pos: { pairAddress, entryCostSol, tokenQty, peakExitVal, tpSeen, openedAt, pool }
 const positions = new Map();
 // avoid re-buy spam per token id
 const attempted = new Set();
@@ -106,18 +108,30 @@ async function ensureQtyFromChain(mint) {
   }
 }
 
-/* ---------- Lightning trade ---------- */
-async function tradeLightning({ action, mint, amount, denomSol=true, slippage=SLIPPAGE, priority=PRIORITY_FEE }){
+/* ---------- choose Lightning pool from pair.dexId ---------- */
+function choosePoolForPair(pair){
+  const dex = (pair?.dexId || '').toLowerCase();
+  if (dex.includes('raydium')) return 'raydium'; // also OK for raydium-cpmm
+  if (dex.includes('pump') || dex.includes('pumpfun') || dex.includes('pumpswap')) return 'pump';
+  if (dex.includes('bonk')) return 'bonk';
+  if (dex.includes('launchlab')) return 'launchlab';
+  return 'auto';
+}
+
+/* ---------- Lightning trade (pool-aware) ---------- */
+async function tradeLightning({ action, mint, amount, denomSol=true, slippage=SLIPPAGE, priority=PRIORITY_FEE, pool='auto' }){
   const url = `${PUMP_LGT}?api-key=${encodeURIComponent(PP_API_KEY)}`;
   const payload = {
     action, mint, amount,
     denominatedInSol: denomSol ? 'true' : 'false',
-    slippage, priorityFee: priority, pool: 'auto', skipPreflight: 'true'
+    slippage, priorityFee: priority,
+    pool,
+    skipPreflight: 'true'
   };
   const j = await postJson(url, payload, { 'x-api-key': PP_API_KEY });
   const sig = j?.signature || j?.txSig;
   if (!sig) throw new Error(`No signature in Lightning response: ${JSON.stringify(j).slice(0,200)}`);
-  console.log('[TRADE OK LGT]', action, mint, 'sig=', sig);
+  console.log('[TRADE OK LGT]', action, mint, 'pool=', pool, 'sig=', sig);
   return sig;
 }
 
@@ -165,9 +179,11 @@ async function fetchPairsForId(id){
   return [];
 }
 
-/* ---------- choose best SOL-quoted pair ---------- */
+/* ---------- choose best SOL-quoted pair (supported DEX only) ---------- */
 function pickBestSolPair(pairs){
-  const sols = pairs.filter(p => p?.quoteToken?.address === SOL_MINT);
+  const sols = pairs
+    .filter(p => p?.quoteToken?.address === SOL_MINT)
+    .filter(p => SUPPORTED_DEX.some(s => (p?.dexId || '').toLowerCase().includes(s)));
   if (sols.length === 0) return null;
 
   const scored = sols.map(p => {
@@ -191,7 +207,7 @@ function pickBestSolPair(pairs){
   return best.p;
 }
 
-/* ---------- scanner (404-safe) ---------- */
+/* ---------- scanner (404-safe, pool-aware) ---------- */
 async function scanAndMaybeBuy(){
   rotateDayIfNeeded();
   try {
@@ -201,15 +217,17 @@ async function scanAndMaybeBuy(){
     if (now - lastBuyAt < BUY_COOLDOWN_MS) return;
 
     const mints = await fetchBoostedSolanaMints();
+    console.log('[SCAN]', 'boostedIds=', mints.length);
+
     for (const mint of mints) {
       if (attempted.has(mint)) continue;
 
       try {
         const pairs = await fetchPairsForId(mint);
-        if (!pairs.length) { attempted.add(mint); continue; }
+        if (!pairs.length) { console.log('[SKIP]', mint, 'no pairs'); attempted.add(mint); continue; }
 
         const best = pickBestSolPair(pairs);
-        if (!best) { attempted.add(mint); continue; }
+        if (!best) { console.log('[SKIP]', mint, 'no SOL-quoted pair hitting filters / unsupported DEX'); attempted.add(mint); continue; }
 
         const baseMint = best?.baseToken?.address;
         const pairAddr = best?.pairAddress;
@@ -218,11 +236,12 @@ async function scanAndMaybeBuy(){
         const buys = +best?.txns?.m5?.buys || 0;
         const sells= +best?.txns?.m5?.sells || 0;
         const liq  = +best?.liquidity?.usd || 0;
+        const pool = choosePoolForPair(best);
 
-        console.log('[CANDIDATE]', baseMint, 'pair=', pairAddr,
-          `5m%=${ch5} vol5=$${vol5} buys=${buys}/${sells} liq=$${liq}`);
+        console.log('[CANDIDATE]', baseMint, 'pair=', pairAddr, 'dexId=', best?.dexId,
+          `5m%=${ch5} vol5=$${vol5} buys=${buys}/${sells} liq=$${liq} pool=${pool}`);
 
-        await tradeLightning({ action: 'buy', mint: baseMint, amount: BUY_SOL });
+        await tradeLightning({ action: 'buy', mint: baseMint, amount: BUY_SOL, pool });
         lastBuyAt = Date.now();
         buysToday += 1;
         attempted.add(mint);
@@ -230,7 +249,8 @@ async function scanAndMaybeBuy(){
         positions.set(baseMint, {
           pairAddress: pairAddr,
           entryCostSol: BUY_SOL + PRIORITY_FEE,
-          tokenQty: 0, peakExitVal: 0, tpSeen: false, openedAt: Date.now()
+          tokenQty: 0, peakExitVal: 0, tpSeen: false, openedAt: Date.now(),
+          pool
         });
 
         const qty = await ensureQtyFromChain(baseMint);
@@ -322,7 +342,9 @@ async function monitorPosition(mint){
 
 async function sellAll(mint){
   try {
-    await tradeLightning({ action: 'sell', mint, amount: '100%', denomSol: false });
+    const pos = positions.get(mint);
+    const pool = pos?.pool || 'auto';
+    await tradeLightning({ action: 'sell', mint, amount: '100%', denomSol: false, pool });
   } catch (e) {
     console.error('[SELL FAIL]', mint, e?.message || e);
     return;
