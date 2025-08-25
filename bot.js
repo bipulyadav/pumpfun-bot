@@ -1,19 +1,18 @@
-// ============= OLD-TOKEN MOMENTUM BOT (Lightning mode) =============
-// DexScreener boosted Solana tokens -> supported DEX pairs (SOL/USDC quotes ok)
-// Buy via PumpPortal Lightning with correct `pool`
-// Exit: +20% TP, trailing after TP, TTL exit if no min profit (no hard SL)
-// Robust: 404-safe + multi-endpoint fallback for pairs + smart skipping
-// -------------------------------------------------------------------
+// ================= OLD-TOKEN MOMENTUM BOT (Lightning mode) =================
+// - Scans DexScreener boosted Solana tokens
+// - Picks supported DEX pairs (Raydium/Pump/Bonk/LaunchLab), SOL or USDC quotes
+// - Buys via PumpPortal Lightning with correct `pool`
+// - Exits: +20% TP, trailing after TP, TTL exit if no min profit (NO hard SL)
+// - 429-safe: NO Solana RPC calls; token qty is estimated from entry price
+// ===========================================================================
 
 import 'dotenv/config';
 import { fetch } from 'undici';
-import { Connection, PublicKey } from '@solana/web3.js';
 
 /* ---------- ENV ---------- */
-const RPC_URL       = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const USE_LIGHTNING = (process.env.USE_LIGHTNING || 'true').toLowerCase() === 'true';
 const PP_API_KEY    = process.env.PP_API_KEY || '';
-const PUBLIC_KEY    = process.env.PUBLIC_KEY || '';          // Lightning wallet pubkey (FUND THIS)
+const PUBLIC_KEY    = process.env.PUBLIC_KEY || ''; // Lightning wallet pubkey (fund this)
 
 if (!USE_LIGHTNING) {
   console.error('This build is Lightning-only. Set USE_LIGHTNING=true.');
@@ -25,12 +24,13 @@ if (!PP_API_KEY || !PUBLIC_KEY) {
 }
 
 /* sizing & fees */
-const BUY_SOL        = parseFloat(process.env.BUY_SOL || '0.0010');   // ~ $0.18–0.25
+const BUY_SOL        = parseFloat(process.env.BUY_SOL || '0.0010');   // ~$0.18–0.25
 const SLIPPAGE       = parseInt(process.env.SLIPPAGE || '10', 10);
 const PRIORITY_FEE   = parseFloat(process.env.PRIORITY_FEE || '0.0000');
+const FEE_PCT        = parseFloat(process.env.FEE_PCT || '1.2') / 100; // est. total fees/slip at entry
 
 /* exits (NO hard SL) */
-const TAKE_PROFIT    = parseFloat(process.env.TAKE_PROFIT_PCT || '20') / 100; // 20%
+const TAKE_PROFIT    = parseFloat(process.env.TAKE_PROFIT_PCT || '20') / 100; // +20%
 const TRAIL_AFTER_HIT= (process.env.TRAIL_AFTER_HIT || 'true').toLowerCase() === 'true';
 const TRAIL_PCT      = parseFloat(process.env.TRAIL_PCT || '12') / 100;       // 12% from peak after TP
 const HOLD_MAX_MS    = parseInt(process.env.HOLD_MAX_MS || '420000', 10);     // 7 min TTL
@@ -57,9 +57,6 @@ const SUPPORTED_DEX = ['raydium', 'raydium-cpmm', 'pump', 'pumpfun', 'pumpswap',
 console.log('[ENV] Lightning=true, BUY_SOL=', BUY_SOL, 'TP=', TAKE_PROFIT, 'TRAIL=', TRAIL_PCT);
 
 /* ---------- state ---------- */
-const conn = new Connection(RPC_URL, { commitment: 'confirmed' });
-const lightningPubkey = new PublicKey(PUBLIC_KEY);
-
 let buysToday = 0;
 let dayStamp  = new Date().toISOString().slice(0,10);
 let lastBuyAt = 0;
@@ -79,6 +76,7 @@ async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function getJson(url){
   const r = await fetch(url, { headers: { 'accept': 'application/json' } });
+  if (r.status === 429) throw new Error('429 Too Many Requests');
   if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
   return await r.json();
 }
@@ -93,29 +91,15 @@ async function postJson(url, body, extraHeaders={}){
   if (!r.ok) throw new Error(`POST ${url} -> ${r.status}: ${text.slice(0,200)}`);
   return j ?? {};
 }
-async function ensureQtyFromChain(mint) {
-  try {
-    const res = await conn.getParsedTokenAccountsByOwner(
-      lightningPubkey, { mint: new PublicKey(mint) }, 'confirmed'
-    );
-    const acct = res?.value?.[0];
-    const amt  = acct?.account?.data?.parsed?.info?.tokenAmount;
-    const uiQ  = amt?.uiAmount || 0;
-    return uiQ;
-  } catch (e) {
-    console.error('[QTY ERR]', e?.message || e); return 0;
-  }
-}
 
+/* ---------- pool helpers ---------- */
 function isSupportedDex(pair){
   const dex = (pair?.dexId || '').toLowerCase();
   return SUPPORTED_DEX.some(s => dex.includes(s));
 }
-
-/* ---------- choose Lightning pool from pair.dexId ---------- */
 function choosePoolForPair(pair){
   const dex = (pair?.dexId || '').toLowerCase();
-  if (dex.includes('raydium')) return 'raydium'; // also OK for raydium-cpmm
+  if (dex.includes('raydium')) return 'raydium'; // also ok for raydium-cpmm
   if (dex.includes('pump') || dex.includes('pumpfun') || dex.includes('pumpswap')) return 'pump';
   if (dex.includes('bonk')) return 'bonk';
   if (dex.includes('launchlab')) return 'launchlab';
@@ -252,25 +236,28 @@ async function scanAndMaybeBuy(){
         const sells    = +best?.txns?.m5?.sells || 0;
         const liq      = +best?.liquidity?.usd || 0;
         const pool     = choosePoolForPair(best);
+        const entryPrice = +best?.priceNative || 0; // in SOL
 
         console.log('[CANDIDATE]', baseMint, 'pair=', pairAddr, 'dexId=', best?.dexId,
           `5m%=${ch5} vol5=$${vol5} buys=${buys}/${sells} liq=$${liq} pool=${pool}`);
 
+        // BUY
         await tradeLightning({ action: 'buy', mint: baseMint, amount: BUY_SOL, pool });
         lastBuyAt = Date.now();
         buysToday += 1;
         attempted.add(mint);                   // buy attempted: mark once
 
+        // estimate token qty from entry price (no RPC)
+        const spendSol   = BUY_SOL + PRIORITY_FEE;
+        const qtyEst     = entryPrice > 0 ? (spendSol * (1 - FEE_PCT)) / entryPrice : 0;
+
         positions.set(baseMint, {
           pairAddress: pairAddr,
-          entryCostSol: BUY_SOL + PRIORITY_FEE,
-          tokenQty: 0, peakExitVal: 0, tpSeen: false, openedAt: Date.now(),
+          entryCostSol: spendSol,
+          tokenQty: qtyEst, peakExitVal: 0, tpSeen: false, openedAt: Date.now(),
           pool
         });
-
-        const qty = await ensureQtyFromChain(baseMint);
-        const pos = positions.get(baseMint);
-        if (pos) { pos.tokenQty = qty; console.log('[POSITION/CHAIN]', baseMint, 'qty=', qty); }
+        console.log('[EST QTY]', baseMint, 'qty≈', qtyEst.toFixed(6), 'entryPrice(SOL)=', entryPrice);
 
         monitorPosition(baseMint).catch(()=>{});
         if (DAILY_MAX_BUYS > 0 && buysToday >= DAILY_MAX_BUYS) break;
@@ -286,13 +273,14 @@ async function scanAndMaybeBuy(){
   }
 }
 
-/* ---------- monitor positions using DexScreener pair price ---------- */
+/* ---------- DexScreener pair fetch ---------- */
 async function fetchPair(chainPair){
   const j = await getJson(`${DS_BASE}/latest/dex/pairs/solana/${chainPair}`);
   const p = j?.pairs?.[0];
   return p || null;
 }
 
+/* ---------- monitor positions (price-based, no RPC) ---------- */
 async function monitorPosition(mint){
   const pos = positions.get(mint);
   if (!pos) return;
@@ -302,14 +290,8 @@ async function monitorPosition(mint){
 
   while (positions.has(mint)) {
     try {
-      // need qty; if not yet present, try once more
-      if (!pos.tokenQty || pos.tokenQty <= 0) {
-        const q = await ensureQtyFromChain(mint);
-        if (q > 0) { pos.tokenQty = q; console.log('[POSITION/CHAIN]', mint, 'qty=', q); }
-      }
-
       const pair = await fetchPair(pairAddress);
-      const priceNative = +pair?.priceNative || 0; // in SOL (DexScreener native)
+      const priceNative = +pair?.priceNative || 0; // in SOL
       if (priceNative <= 0 || !pos.tokenQty) { await sleep(2500); continue; }
 
       const estExit = priceNative * pos.tokenQty; // SOL value
