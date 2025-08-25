@@ -1,13 +1,14 @@
 // ============= OLD-TOKEN MOMENTUM BOT (Lightning mode) =============
-// Scans DexScreener boosted Solana tokens, filters by momentum & liquidity,
-// buys via PumpPortal Lightning, exits on +20% TP / trailing / TTL (no hard SL).
+// DexScreener boosted Solana tokens -> SOL-quoted pairs -> buy via Lightning
+// Exit: +20% TP, then trailing; TTL exit if no min profit (no hard SL).
+// 404-safe + multi-endpoint fallback for pairs.
 // -------------------------------------------------------------------
 
 import 'dotenv/config';
 import { fetch } from 'undici';
 import { Connection, PublicKey } from '@solana/web3.js';
 
-// ---------- ENV ----------
+/* ---------- ENV ---------- */
 const RPC_URL       = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const USE_LIGHTNING = (process.env.USE_LIGHTNING || 'true').toLowerCase() === 'true';
 const PP_API_KEY    = process.env.PP_API_KEY || '';
@@ -22,19 +23,19 @@ if (!PP_API_KEY || !PUBLIC_KEY) {
   setInterval(() => {}, 1e9);
 }
 
-// sizing & fees
+/* sizing & fees */
 const BUY_SOL        = parseFloat(process.env.BUY_SOL || '0.0010');   // ~ $0.18–0.25
 const SLIPPAGE       = parseInt(process.env.SLIPPAGE || '10', 10);
 const PRIORITY_FEE   = parseFloat(process.env.PRIORITY_FEE || '0.0000');
 
-// exits (NO hard SL)
+/* exits (NO hard SL) */
 const TAKE_PROFIT    = parseFloat(process.env.TAKE_PROFIT_PCT || '20') / 100; // 20%
 const TRAIL_AFTER_HIT= (process.env.TRAIL_AFTER_HIT || 'true').toLowerCase() === 'true';
 const TRAIL_PCT      = parseFloat(process.env.TRAIL_PCT || '12') / 100;       // 12% from peak after TP
 const HOLD_MAX_MS    = parseInt(process.env.HOLD_MAX_MS || '420000', 10);     // 7 min TTL
 const TTL_MIN_PROFIT = parseFloat(process.env.TTL_MIN_PROFIT_PCT || '5')/100; // +5% req by TTL
 
-// momentum filters (DexScreener)
+/* momentum filters (DexScreener) */
 const BOOST_POLL_MS  = parseInt(process.env.BOOST_POLL_MS || '20000', 10);    // poll boosts each 20s
 const MIN_5M_CHANGE  = parseFloat(process.env.MIN_5M_CHANGE || '15');         // ≥+15% in 5m
 const MIN_5M_BUYS    = parseInt(process.env.MIN_5M_BUYS || '30', 10);         // ≥30 buys last 5m
@@ -43,18 +44,18 @@ const MIN_LIQ_USD    = parseFloat(process.env.MIN_LIQ_USD || '30000');        //
 const MAX_LIQ_USD    = parseFloat(process.env.MAX_LIQ_USD || '250000');       // liq ≤ $250k
 const MIN_VOL_5M_USD = parseFloat(process.env.MIN_VOL_5M_USD || '7000');      // ≥$7k vol 5m
 
-// risk: throttles
+/* throttles */
 const DAILY_MAX_BUYS = parseInt(process.env.DAILY_MAX_BUYS || '6', 10);
 const BUY_COOLDOWN_MS= parseInt(process.env.BUY_COOLDOWN_MS || '60000', 10);  // 1 min
 
-// constants
+/* constants */
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DS_BASE  = 'https://api.dexscreener.com';
 const PUMP_LGT = 'https://pumpportal.fun/api/trade';
 
 console.log('[ENV] Lightning=true, BUY_SOL=', BUY_SOL, 'TP=', TAKE_PROFIT, 'TRAIL=', TRAIL_PCT);
 
-// ---------- state ----------
+/* ---------- state ---------- */
 const conn = new Connection(RPC_URL, { commitment: 'confirmed' });
 const lightningPubkey = new PublicKey(PUBLIC_KEY);
 
@@ -65,10 +66,10 @@ let lastBuyAt = 0;
 // mint -> pos
 // pos: { pairAddress, entryCostSol, tokenQty, peakExitVal, tpSeen, openedAt }
 const positions = new Map();
-// to avoid re-buy spam per token
+// avoid re-buy spam per token id
 const attempted = new Set();
 
-// ---------- utils ----------
+/* ---------- utils ---------- */
 function rotateDayIfNeeded(){
   const d = new Date().toISOString().slice(0,10);
   if (d !== dayStamp) { dayStamp = d; buysToday = 0; console.log('[DAY RESET]', d); }
@@ -105,7 +106,7 @@ async function ensureQtyFromChain(mint) {
   }
 }
 
-// ---------- trade via Lightning ----------
+/* ---------- Lightning trade ---------- */
 async function tradeLightning({ action, mint, amount, denomSol=true, slippage=SLIPPAGE, priority=PRIORITY_FEE }){
   const url = `${PUMP_LGT}?api-key=${encodeURIComponent(PP_API_KEY)}`;
   const payload = {
@@ -120,22 +121,52 @@ async function tradeLightning({ action, mint, amount, denomSol=true, slippage=SL
   return sig;
 }
 
-// ---------- momentum scan (DexScreener boosts -> pairs) ----------
+/* ---------- boosted IDs (skip pump.fun mint IDs) ---------- */
 async function fetchBoostedSolanaMints(){
-  // token-boosts: list of boosted tokens across chains
   const boosts = await getJson(`${DS_BASE}/token-boosts/latest/v1`);
   const rows = Array.isArray(boosts) ? boosts : (boosts?.tokens || boosts?.data || []);
   const sols = rows.filter(x => (x?.chainId || '').toLowerCase() === 'solana');
+
   const set = new Set();
   for (const r of sols) {
     const t = r.tokenAddress || r.address || r.token;
-    if (t) set.add(t);
+    if (!t) continue;
+    // old-token mode: skip new-mint style ids (…pump)
+    if (String(t).toLowerCase().endsWith('pump')) continue;
+    set.add(t);
   }
   return [...set];
 }
 
+/* ---------- pairs fallback (tokens -> token-pairs -> search) ---------- */
+async function fetchPairsForId(id){
+  if (String(id).toLowerCase().endsWith('pump')) return [];
+
+  // Try #1: latest/dex/tokens
+  try {
+    const toks = await getJson(`${DS_BASE}/latest/dex/tokens/solana/${id}`);
+    const arr = Array.isArray(toks?.pairs) ? toks.pairs : [];
+    if (arr.length) return arr;
+  } catch {}
+
+  // Try #2: token-pairs/v1 (older but forgiving)
+  try {
+    const arr = await getJson(`${DS_BASE}/token-pairs/v1/solana/${id}`);
+    if (Array.isArray(arr) && arr.length) return arr;
+  } catch {}
+
+  // Try #3: latest/dex/search
+  try {
+    const s = await getJson(`${DS_BASE}/latest/dex/search?q=${encodeURIComponent(id)}`);
+    const arr = Array.isArray(s?.pairs) ? s.pairs : [];
+    return arr.filter(p => (p?.chainId || '').toLowerCase() === 'solana');
+  } catch {}
+
+  return [];
+}
+
+/* ---------- choose best SOL-quoted pair ---------- */
 function pickBestSolPair(pairs){
-  // choose SOL-quoted pair with decent liquidity and recent activity
   const sols = pairs.filter(p => p?.quoteToken?.address === SOL_MINT);
   if (sols.length === 0) return null;
 
@@ -160,9 +191,10 @@ function pickBestSolPair(pairs){
   return best.p;
 }
 
+/* ---------- scanner (404-safe) ---------- */
 async function scanAndMaybeBuy(){
+  rotateDayIfNeeded();
   try {
-    rotateDayIfNeeded();
     if (DAILY_MAX_BUYS > 0 && buysToday >= DAILY_MAX_BUYS) return;
 
     const now = Date.now();
@@ -172,62 +204,58 @@ async function scanAndMaybeBuy(){
     for (const mint of mints) {
       if (attempted.has(mint)) continue;
 
-      // pools for this mint (use latest/dex/tokens -> pairs array)
-      const toks = await getJson(`${DS_BASE}/latest/dex/tokens/solana/${mint}`);
-      const pairs = Array.isArray(toks?.pairs) ? toks.pairs : [];
-      const best = pickBestSolPair(pairs);
-      if (!best) continue;
-
-      const baseMint = best?.baseToken?.address;
-      const pairAddr = best?.pairAddress;
-      const ch5  = +best?.priceChange?.m5 || 0;
-      const vol5 = +best?.volume?.m5 || 0;
-      const buys = +best?.txns?.m5?.buys || 0;
-      const sells= +best?.txns?.m5?.sells || 0;
-      const liq  = +best?.liquidity?.usd || 0;
-
-      console.log('[CANDIDATE]', baseMint, 'pair=', pairAddr,
-        `5m%=${ch5} vol5=$${vol5} buys=${buys}/${sells} liq=$${liq}`);
-
-      // buy
       try {
+        const pairs = await fetchPairsForId(mint);
+        if (!pairs.length) { attempted.add(mint); continue; }
+
+        const best = pickBestSolPair(pairs);
+        if (!best) { attempted.add(mint); continue; }
+
+        const baseMint = best?.baseToken?.address;
+        const pairAddr = best?.pairAddress;
+        const ch5  = +best?.priceChange?.m5 || 0;
+        const vol5 = +best?.volume?.m5 || 0;
+        const buys = +best?.txns?.m5?.buys || 0;
+        const sells= +best?.txns?.m5?.sells || 0;
+        const liq  = +best?.liquidity?.usd || 0;
+
+        console.log('[CANDIDATE]', baseMint, 'pair=', pairAddr,
+          `5m%=${ch5} vol5=$${vol5} buys=${buys}/${sells} liq=$${liq}`);
+
         await tradeLightning({ action: 'buy', mint: baseMint, amount: BUY_SOL });
+        lastBuyAt = Date.now();
+        buysToday += 1;
+        attempted.add(mint);
+
+        positions.set(baseMint, {
+          pairAddress: pairAddr,
+          entryCostSol: BUY_SOL + PRIORITY_FEE,
+          tokenQty: 0, peakExitVal: 0, tpSeen: false, openedAt: Date.now()
+        });
+
+        const qty = await ensureQtyFromChain(baseMint);
+        const pos = positions.get(baseMint);
+        if (pos) { pos.tokenQty = qty; console.log('[POSITION/CHAIN]', baseMint, 'qty=', qty); }
+
+        monitorPosition(baseMint).catch(()=>{});
+        if (DAILY_MAX_BUYS > 0 && buysToday >= DAILY_MAX_BUYS) break;
+
       } catch (e) {
-        console.error('[BUY FAIL]', baseMint, e?.message || e);
-        attempted.add(mint); // avoid re-spam
+        console.error('[CANDIDATE ERR]', mint, e?.message || e);
+        attempted.add(mint);
         continue;
       }
-
-      lastBuyAt = Date.now();
-      buysToday += 1;
-      attempted.add(mint);
-
-      // set up position tracking
-      positions.set(baseMint, {
-        pairAddress: pairAddr,
-        entryCostSol: BUY_SOL + PRIORITY_FEE,
-        tokenQty: 0, peakExitVal: 0, tpSeen: false, openedAt: Date.now()
-      });
-
-      // fetch token qty from chain (Lightning fills may not appear in WS)
-      const qty = await ensureQtyFromChain(baseMint);
-      const pos = positions.get(baseMint);
-      if (pos) { pos.tokenQty = qty; console.log('[POSITION/CHAIN]', baseMint, 'qty=', qty); }
-
-      // start monitor loop (detached)
-      monitorPosition(baseMint).catch(()=>{});
-      if (DAILY_MAX_BUYS > 0 && buysToday >= DAILY_MAX_BUYS) break;
     }
   } catch (e) {
-    console.error('[SCAN ERR]', e?.message || e);
+    console.error('[SCAN TOP ERR]', e?.message || e);
   }
 }
 
-// ---------- monitor positions using DexScreener pair price ----------
+/* ---------- monitor positions using DexScreener pair price ---------- */
 async function fetchPair(chainPair){
   const j = await getJson(`${DS_BASE}/latest/dex/pairs/solana/${chainPair}`);
   const p = j?.pairs?.[0];
-  return p || null; // includes priceNative, txns, liquidity, priceChange, etc.
+  return p || null;
 }
 
 async function monitorPosition(mint){
@@ -246,7 +274,7 @@ async function monitorPosition(mint){
       }
 
       const pair = await fetchPair(pairAddress);
-      const priceNative = +pair?.priceNative || 0; // in SOL (because quote=SOL)
+      const priceNative = +pair?.priceNative || 0; // in SOL (quote=SOL)
       if (priceNative <= 0 || !pos.tokenQty) { await sleep(2500); continue; }
 
       const estExit = priceNative * pos.tokenQty; // SOL value
@@ -302,7 +330,7 @@ async function sellAll(mint){
   positions.delete(mint);
 }
 
-// ---------- main loop ----------
+/* ---------- main loop ---------- */
 console.log('[START] Old-token momentum mode (DexScreener boosts)');
 setInterval(scanAndMaybeBuy, BOOST_POLL_MS);
 scanAndMaybeBuy(); // kick immediately
