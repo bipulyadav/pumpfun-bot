@@ -1,20 +1,15 @@
- {
-  "name": "pumpfun-bot",
+{
+  "name": "old-momentum-bot",
   "version": "1.0.0",
-  "description": "Pump.fun sniper bot (instant buy + 50% TP)",
-  "main": "bot.js",
+  "private": true,
   "type": "module",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "start:dev": "NODE_OPTIONS=--trace-warnings node bot.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.3",
-    "bs58": "^6.0.0",
+    "@solana/web3.js": "^1.95.0",
     "dotenv": "^16.4.5",
-    "undici": "^6.19.8",
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=18 <21"
+    "undici": "^6.19.8"
   }
 }
